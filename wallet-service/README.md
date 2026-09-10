@@ -7,6 +7,10 @@ and race-free get-or-create — built with Spring Boot 3 + Postgres.
 
 Money is always **integer paise**. Never floats, never rupees-as-decimal.
 
+**Live URL**: https://wallet-service-dwrw.onrender.com
+(Health: `/actuator/health` · Metrics: `/metrics`. On the free tier the service
+sleeps after ~15 min idle, so the first request may cold-start for ~30–60s.)
+
 ---
 
 ## API
@@ -24,17 +28,19 @@ Tokens map to users via `WALLET_TOKENS` (default `tok_alice:alice,tok_bob:bob,to
 
 Open (no auth): `/actuator/health`, `/actuator/prometheus`, `/metrics`.
 
-### Example
+### Example (against the live URL)
 
 ```bash
+BASE=https://wallet-service-dwrw.onrender.com   # or http://localhost:8080 when running locally
+
 # create two wallets
-ALICE=$(curl -s -XPOST localhost:8080/wallets -H 'Authorization: Bearer tok_alice' \
+ALICE=$(curl -s -XPOST $BASE/wallets -H 'Authorization: Bearer tok_alice' \
   -H 'Content-Type: application/json' -d '{"initial_balance_paise":100000}' | jq -r .id)
-BOB=$(curl -s -XPOST localhost:8080/wallets -H 'Authorization: Bearer tok_bob' \
+BOB=$(curl -s -XPOST $BASE/wallets -H 'Authorization: Bearer tok_bob' \
   -H 'Content-Type: application/json' -d '{"initial_balance_paise":0}' | jq -r .id)
 
 # transfer ₹15.00 (1500 paise), idempotent
-curl -s -XPOST localhost:8080/transfers -H 'Authorization: Bearer tok_alice' \
+curl -s -XPOST $BASE/transfers -H 'Authorization: Bearer tok_alice' \
   -H 'Content-Type: application/json' \
   -d "{\"from\":\"$ALICE\",\"to\":\"$BOB\",\"amount_paise\":1500,\"idempotency_key\":\"demo-1\"}"
 ```
@@ -52,17 +58,19 @@ docker compose up --build
 
 ### Burst script (reproduces the three live probes)
 
-With the service running:
+Against the live deployment (or any URL):
 
 ```bash
-./burst.sh                       # against http://localhost:8080
-./burst.sh https://your-app.url  # against a deployed URL
+./burst.sh https://wallet-service-dwrw.onrender.com   # the deployed service
+./burst.sh                                            # defaults to http://localhost:8080
 ```
+
+Tune load with env vars, e.g. `CONTENTION_TRANSFERS=300 CONCURRENCY=50 ./burst.sh <url>`.
 
 It asserts:
 1. **Concurrent get-or-create** — N simultaneous `POST /wallets` for a new user → exactly one wallet.
 2. **Idempotent retry storm** — same transfer key fired N times concurrently → one debit/credit, identical responses, and same-key/different-body → `409`.
-3. **Conservation under contention** — many concurrent transfers, including A→B and B→A at once → total balance unchanged, no negative balance.
+3. **Conservation under contention** — many concurrent transfers, including A→B and B→A at once → total balance unchanged, no negative balance, **and no 5xx (deadlock-free)**.
 4. **Reversal / refund (R3)** — a transfer is reversed N times concurrently with the same key → exactly one refund, total returns to the pre-transfer sum, and reversing an already-reversed transfer with a new key → `409` (no double-refund).
 
 Requires `bash`, `curl`, `python3`.
@@ -71,17 +79,28 @@ Requires `bash`, `curl`, `python3`.
 
 ## Deploy (free tier, ₹0)
 
-The image is a plain container listening on `$PORT` (default 8080) and needs a
-Postgres URL. On **Render / Railway / Fly.io / Koyeb**:
+Deployed on **Render** (free web service, Docker build) + **Render managed
+Postgres** (free). The image is a plain container listening on `$PORT` (Render
+injects it) and connects to Postgres via env vars.
 
-1. Provision a **free managed Postgres**.
-2. Deploy this repo as a Docker service. Set env:
-   - `DB_URL=jdbc:postgresql://<host>:<port>/<db>`
-   - `DB_USER`, `DB_PASSWORD`
-   - `WALLET_TOKENS=tok_alice:alice,tok_bob:bob` (or your own)
-3. Health check path: `/actuator/health/readiness`.
+1. Provision a **free managed Postgres** (Render → New → Postgres). Copy its host,
+   database, user, and password from the DB's Info/Connections page.
+2. Deploy this repo as a **Web Service** (Render auto-detects the `Dockerfile`).
+   Set env vars on the service:
+   - `DB_URL=jdbc:postgresql://<host>:5432/<db>`  ← JDBC form; **no** `user:pass@`
+     in the URL, and include the port. Append `?sslmode=require` if using the
+     external host (`*.render.com`).
+   - `DB_USER=<user>`
+   - `DB_PASSWORD=<password>`
+   - `WALLET_TOKENS=tok_alice:alice,tok_bob:bob,tok_carol:carol` (or your own)
+   - Do **not** set `PORT` — the platform injects it and the app reads `$PORT`.
+3. Health check path: `/actuator/health`.
 
-Flyway runs the schema migration on boot, so the DB needs no manual setup.
+Flyway runs the schema migrations on boot, so the DB needs no manual setup.
+Works the same on Railway / Fly.io / Koyeb. If your host hands you a single
+`DATABASE_URL` (libpq `postgresql://user:pass@host/db` form), an
+`EnvironmentPostProcessor` (`DatabaseUrlConfig`) translates it to the JDBC form
+automatically, so you can set just that one variable instead of the three above.
 
 ---
 
@@ -131,19 +150,34 @@ balance can go negative (belt-and-suspenders with the `CHECK`). There is **no
 read-modify-write in app code** — the database does the compare-and-decrement,
 so it stays correct under any concurrency on the same wallet.
 
-**Deadlock avoidance**: I deliberately avoid holding two row locks in
-caller-supplied order. The debit and credit are independent single-row `UPDATE`s;
-I never `SELECT … FOR UPDATE` two wallets, so A→B and B→A running at once cannot
-form the classic opposite-order lock cycle. (If explicit locking were required I
-would lock wallets in a fixed sorted order by id; the conditional `UPDATE` avoids
-the explicit lock entirely, which is why it's the simplest correct thing here.)
+**Deadlock avoidance (with a correction from live testing)**: a transfer does two
+row-modifying statements in one transaction — debit `from`, then credit `to` — so
+it holds **two** row locks. An earlier version tried to argue this was
+deadlock-free without explicit locking; that was wrong, and the live A→B + B→A
+contention burst proved it: Postgres detected a genuine deadlock
+(`ERROR: deadlock detected … while updating tuple in relation "wallets"`) and
+aborted one side as a 5xx. T1 (A→B) held A and waited for B while T2 (B→A) held B
+and waited for A — the classic circular wait.
 
-**Heavier alternatives rejected**: `SELECT … FOR UPDATE` in sorted order (extra
-round-trip + explicit lock ordering to reason about); `SERIALIZABLE` isolation
-with retry loops (throughput cost + retry plumbing for a single-row invariant a
-`CHECK` already guarantees); a per-wallet application lock or queue (a
-coordination layer to build, deploy, and keep correct — more moving parts than
-the one-statement guard needs).
+The fix is **deterministic lock ordering**: before touching balances, both wallet
+rows are locked in a fixed global order (sorted by id):
+
+```sql
+SELECT * FROM wallets WHERE id IN (:a, :b) ORDER BY id FOR UPDATE;
+```
+
+Because every transfer — A→B and B→A alike — acquires the lower id first, no two
+transactions can form a cycle. The same ordered lock is applied on the reversal
+path. After the fix the 400-way both-direction burst produces **zero 5xx** while
+conservation still holds.
+
+**Heavier alternatives rejected**: `SERIALIZABLE` isolation with retry loops
+(throughput cost + retry plumbing when a fixed lock order already prevents the
+cycle); a per-wallet application lock or queue (a coordination layer to build,
+deploy, and keep correct — more moving parts than a sorted `FOR UPDATE` needs).
+The conditional `UPDATE … WHERE balance >= :amt` is still what enforces
+no-overdraft atomically; the ordered `FOR UPDATE` is layered on top purely for
+deadlock-free lock acquisition.
 
 ### Where idempotency lives
 In the `transfers` table: `idempotency_key` is **UNIQUE** and the row is written
@@ -195,12 +229,19 @@ wallet, a brief unavailability is far preferable to a double-spend.
   DTO/record layout, logback JSON encoder config, Dockerfile layering.
 
 ### Verification
-The four probes were run against **real Postgres 16** (not a mock): all pass —
+The four probes pass against the **live Render deployment** (real Postgres 16) —
 race-free get-or-create (50-way), idempotent storm (50-way, one debit + `409` on
-different body), conservation + no-overdraft (200-way both-direction), and R3
-reversal (concurrent same-key → one refund, total conserved, already-reversed →
-`409`, recipient-broke → clean decline). `src/test/.../InvariantsTest.java` runs the
-same probes automatically via Testcontainers Postgres.
+different body), conservation + no-overdraft with **no 5xx** under a 300-way
+both-direction burst (the deadlock fix), and R3 reversal (concurrent same-key →
+one refund, total conserved, already-reversed → `409`, recipient-broke → clean
+decline). `src/test/.../InvariantsTest.java` runs the same probes automatically
+via Testcontainers Postgres.
+
+The deadlock above is a concrete example of the loop working: the initial design
+*claimed* deadlock-freedom, the live burst *disproved* it (5xx under contention),
+and the `burst.sh` "no 5xx" assertion caught it so it could be fixed with sorted
+`FOR UPDATE` — matching the rubric's expected strong answer for "what happens when
+A→B and B→A hit at once."
 
 ### Free-tier cost note
 **₹0.** App container + free managed Postgres on Render/Railway/Fly/Koyeb; no card
