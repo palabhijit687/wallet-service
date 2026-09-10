@@ -1,0 +1,11 @@
+spring:
+  # Datasource is supplied by Testcontainers at runtime (see InvariantsTest).
+  jpa:
+    hibernate:
+      # Validate against the Flyway-built schema on real Postgres.
+      ddl-auto: validate
+  flyway:
+    enabled: true
+
+wallet:
+  tokens: tok_alice:alice,tok_bob:bob
