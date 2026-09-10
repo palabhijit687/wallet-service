@@ -151,28 +151,34 @@ probe_conservation() {
   total_before=$((a + b))
   echo "  start: alice=$a bob=$b total=$total_before"
 
+  : > "$WORK/cont_status"
   for i in $(seq 1 "$CONTENTION_TRANSFERS"); do
     local key="cont-$(date +%s)-$i-$RANDOM"
     if (( i % 2 == 0 )); then
       # A -> B
-      ( api POST /transfers "$TOK_ALICE" \
-          "{\"from\":\"$ALICE_ID\",\"to\":\"$BOB_ID\",\"amount_paise\":100,\"idempotency_key\":\"$key\"}" \
-          >/dev/null 2>&1 || true ) &
+      ( curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/transfers" \
+          -H "Authorization: Bearer $TOK_ALICE" -H "Content-Type: application/json" \
+          -d "{\"from\":\"$ALICE_ID\",\"to\":\"$BOB_ID\",\"amount_paise\":100,\"idempotency_key\":\"$key\"}" \
+          >> "$WORK/cont_status" 2>/dev/null || true ) &
     else
       # B -> A  (opposite direction at the same time -> deadlock-order stress)
-      ( api POST /transfers "$TOK_BOB" \
-          "{\"from\":\"$BOB_ID\",\"to\":\"$ALICE_ID\",\"amount_paise\":100,\"idempotency_key\":\"$key\"}" \
-          >/dev/null 2>&1 || true ) &
+      ( curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/transfers" \
+          -H "Authorization: Bearer $TOK_BOB" -H "Content-Type: application/json" \
+          -d "{\"from\":\"$BOB_ID\",\"to\":\"$ALICE_ID\",\"amount_paise\":100,\"idempotency_key\":\"$key\"}" \
+          >> "$WORK/cont_status" 2>/dev/null || true ) &
     fi
     # cap in-flight fan-out so we don't exhaust local fds
     if (( i % 50 == 0 )); then wait; fi
   done
   wait
 
-  local a2 b2 total_after
+  local a2 b2 total_after server_errors
   a2=$(api GET "/wallets/$ALICE_ID" "$TOK_ALICE" | json balance_paise)
   b2=$(api GET "/wallets/$BOB_ID" "$TOK_BOB" | json balance_paise)
   total_after=$((a2 + b2))
+  # grep -c exits 1 on zero matches; guard it so `set -e` doesn't abort here.
+  server_errors=$( { grep -c '^5[0-9][0-9]$' "$WORK/cont_status" || true; } 2>/dev/null )
+  server_errors=${server_errors:-0}
   echo "  end:   alice=$a2 bob=$b2 total=$total_after"
 
   [[ "$total_after" -eq "$total_before" ]] \
@@ -182,6 +188,10 @@ probe_conservation() {
   { [[ "$a2" -ge 0 ]] && [[ "$b2" -ge 0 ]]; } \
     && pass "no negative balances (alice=$a2, bob=$b2)" \
     || fail "a balance went negative (alice=$a2, bob=$b2)"
+
+  [[ "$server_errors" -eq 0 ]] \
+    && pass "no 5xx under contention (deadlock-free)" \
+    || fail "$server_errors requests returned 5xx (likely deadlock) under contention"
 }
 
 # ---------------------------------------------------------------------------
