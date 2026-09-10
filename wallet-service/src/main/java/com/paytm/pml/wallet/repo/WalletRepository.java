@@ -14,6 +14,21 @@ public interface WalletRepository extends JpaRepository<Wallet, UUID> {
     Optional<Wallet> findByOwnerUser(String ownerUser);
 
     /**
+     * Lock two wallet rows FOR UPDATE in a DETERMINISTIC order (sorted by id via
+     * ORDER BY), regardless of which is the sender or receiver. Because every
+     * transfer -- A->B and B->A alike -- acquires the lower id first, no two
+     * transactions can form a circular wait, so the opposite-direction burst
+     * cannot deadlock. Returns the locked rows (existence check happens here too).
+     */
+    @Query(value = """
+            SELECT * FROM wallets
+             WHERE id IN (:a, :b)
+             ORDER BY id
+             FOR UPDATE
+            """, nativeQuery = true)
+    java.util.List<Wallet> lockTwoInOrder(@Param("a") UUID a, @Param("b") UUID b);
+
+    /**
      * Race-free get-or-create in one statement. INSERT ... ON CONFLICT DO NOTHING
      * on the unique owner_user constraint: exactly one concurrent insert wins, the
      * losers affect 0 rows WITHOUT aborting the transaction (unlike catching a
