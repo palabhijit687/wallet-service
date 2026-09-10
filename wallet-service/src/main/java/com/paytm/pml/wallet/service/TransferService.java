@@ -47,8 +47,9 @@ public class TransferService {
      *    means insufficient funds -> we finalize the claimed row as DECLINED and
      *    commit no balance change. The credit is a plain atomic UPDATE of equal
      *    magnitude, so the sum of balances is invariant.
-     *  - Deadlock-free: independent single-row UPDATEs, never two row locks held in
-     *    caller-supplied order, so A->B and B->A concurrently cannot form a cycle.
+     *  - Deadlock-free: both wallet rows are locked FOR UPDATE in a DETERMINISTIC
+     *    order (sorted by id) at the start, so A->B and B->A always acquire the
+     *    lower id first and cannot form a circular wait.
      */
     @Transactional
     public TransferResult transfer(String requestedBy, UUID fromId, UUID toId,
@@ -64,11 +65,14 @@ public class TransferService {
             return resolveReplay(prior.get(), requestHash, idempotencyKey);
         }
 
-        // Both wallets must exist (clean 404 rather than an FK error).
-        wallets.findById(fromId).orElseThrow(() -> new ApiException(
-                HttpStatus.NOT_FOUND, "wallet_not_found", "no from wallet " + fromId));
-        wallets.findById(toId).orElseThrow(() -> new ApiException(
-                HttpStatus.NOT_FOUND, "wallet_not_found", "no to wallet " + toId));
+        // Lock BOTH wallets in deterministic id order before touching balances.
+        // This is the deadlock-avoidance guarantee: A->B and B->A both lock the
+        // lower id first, so opposite-direction transfers can't form a lock cycle.
+        // It also confirms both wallets exist (clean 404 otherwise).
+        if (wallets.lockTwoInOrder(fromId, toId).size() != 2) {
+            throw new ApiException(HttpStatus.NOT_FOUND, "wallet_not_found",
+                    "one or both wallets do not exist");
+        }
 
         // Claim the key. If we don't win the insert, a concurrent writer owns it;
         // re-read and replay (their committed result once their tx lands).
@@ -79,7 +83,7 @@ public class TransferService {
             return awaitConcurrentWinner(idempotencyKey, requestHash);
         }
 
-        // We own the key for this tx. Move the money, then finalize the row.
+        // We own the key + hold both row locks. Move the money, then finalize.
         int debited = wallets.tryDebit(fromId, amountPaise);
         if (debited == 0) {
             transfers.finalizeStatus(transferId, "DECLINED", "INSUFFICIENT_FUNDS");
@@ -165,6 +169,10 @@ public class TransferService {
         UUID to = original.getFromWallet();
         long amount = original.getAmountPaise();
         String requestHash = fingerprint("reverse", from, to, amount);
+
+        // Lock both wallets in deterministic id order (same rule as transfer), so a
+        // reversal and a concurrent transfer over the same pair cannot deadlock.
+        wallets.lockTwoInOrder(from, to);
 
         UUID reversalId = UUID.randomUUID();
         int claimed = transfers.insertReversalIfAbsent(reversalId, idempotencyKey, requestedBy,
